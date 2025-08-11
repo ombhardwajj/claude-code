@@ -164,4 +164,3 @@ jobs:
           name: rust-project
           path: .
           if-no-files-found: warn
-```
