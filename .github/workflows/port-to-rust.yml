@@ -22,11 +22,12 @@ jobs:
 
       - name: Fetch repo digest using gitingest or clone
         run: |
-          GITINGEST_URL="${{ inputs.repo_url }}"
-          GITINGEST_URL="${GITINGEST_URL/github.com/gitingest.com}"
-          curl -s "$GITINGEST_URL" > repo_digest.txt
+          REPO_PATH=$(echo "${{ inputs.repo_url }}" | sed 's|https://github.com/||' | sed 's|.git$||')
+          curl -s -X POST https://gitingest.com/api/ingest \
+            -H 'Content-Type: application/json' \
+            -d '{"input_text":"'"$REPO_PATH"'","token":"","max_file_size":"50","pattern_type":"exclude","pattern":""}' > repo_digest.txt
           if [ ! -s repo_digest.txt ]; then
-            echo "Warning: Gitingest failed, attempting to clone repo"
+            echo "Warning: Gitingest API failed, attempting to clone repo"
             REPO_NAME=$(basename ${{ inputs.repo_url }} .git)
             git clone ${{ inputs.repo_url }} $REPO_NAME
             find $REPO_NAME -type f \( -name "*.py" -o -name "*.cpp" \) -exec cat {} \; > repo_digest.txt
