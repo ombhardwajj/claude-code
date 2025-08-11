@@ -1,0 +1,133 @@
+name: Port Repo to Rust
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'GitHub repo URL of the Python or C++ project to port (e.g., https://github.com/user/simple-python-repo)'
+        required: true
+        type: string
+
+jobs:
+  port:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (for any custom scripts if needed later)
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl python3
+
+      - name: Fetch repo digest using gitingest
+        run: |
+          GITINGEST_URL="${{ inputs.repo_url }}"
+          GITINGEST_URL="${GITINGEST_URL/github.com/gitingest.com}"
+          curl -s "$GITINGEST_URL" > repo_digest.txt
+          if [ ! -s repo_digest.txt ]; then
+            echo "Error: Failed to fetch digest from $GITINGEST_URL"
+            exit 1
+          fi
+
+      - name: Call Gemini API to port to Rust
+        run: |
+          PROMPT="The following is a codebase digest (from Python or C++). Port it entirely to Rust, creating a compilable project. Include Cargo.toml if needed, and all source files. Output in this exact structured format for each file, separated by ---:
+          ---
+          File: <relative/path/to/file e.g., Cargo.toml or src/main.rs>
+          Content:
+          \`\`\`
+          <complete file content here>
+          \`\`\`
+          ---
+          Ensure the project compiles with cargo build.
+          
+          Codebase digest:
+          $(cat repo_digest.txt)"
+          
+          RESPONSE=$(curl -s https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key=${{ secrets.GEMINI_API_KEY }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "contents": [{
+                "parts": [{
+                  "text": "'"$PROMPT"'"
+                }]
+              }],
+              "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 8192
+              }
+            }')
+          
+          echo "$RESPONSE" > response.json
+          jq -r '.candidates[0].content.parts[0].text // .error.message // "Error: API call failed"' response.json > rust_project.txt
+          if grep -q "Error" rust_project.txt; then
+            cat rust_project.txt
+            exit 1
+          fi
+
+      - name: Parse LLM response to create Rust files
+        run: |
+          python3 - <<EOF
+          import re
+          import os
+
+          with open('rust_project.txt', 'r') as f:
+              content = f.read().strip()
+
+          # Split by --- separator
+          sections = re.split(r'---\s*', content)
+          for section in sections:
+              section = section.strip()
+              if not section:
+                  continue
+              
+              lines = section.split('\n')
+              if not lines[0].startswith('File: '):
+                  continue
+              
+              file_path = lines[0][6:].strip()
+              # Find start of content
+              content_start_idx = next((i for i, line in enumerate(lines) if line.startswith('Content:')), None)
+              if content_start_idx is None:
+                  continue
+              
+              code_lines = lines[content_start_idx + 1:]
+              # Strip leading/trailing code blocks if present
+              if code_lines and code_lines[0].startswith('```'):
+                  code_lines = code_lines[1:]
+              if code_lines and code_lines[-1].startswith('```'):
+                  code_lines = code_lines[:-1]
+              
+              code = '\n'.join(code_lines).strip()
+              
+              os.makedirs(os.path.dirname(file_path), exist_ok=True)
+              with open(file_path, 'w') as fw:
+                  fw.write(code)
+          EOF
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Compile generated Rust project
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            cargo build --verbose
+          else
+            echo "No Cargo.toml found; assuming single-file project"
+            if ls *.rs 1> /dev/null 2>&1; then
+              rustc *.rs
+            else
+              echo "Error: No Rust files generated"
+              exit 1
+            fi
+          fi
+
+      - name: Upload Rust project artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-project
+          path: .
+          if-no-files-found: ignore
