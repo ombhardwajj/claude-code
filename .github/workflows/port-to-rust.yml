@@ -1,10 +1,11 @@
+```yaml
 name: Port Repo to Rust
 
 on:
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'GitHub repo URL of the Python or C++ project to port (e.g., https://github.com/user/simple-python-repo)'
+        description: 'GitHub repo URL of the Python or C++ project to port (e.g., https://github.com/dbarnett/python-helloworld)'
         required: true
         type: string
 
@@ -18,29 +19,37 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq curl python3
+          sudo apt-get install -y jq curl python3 git
 
-      - name: Fetch repo digest using gitingest
+      - name: Fetch repo digest using gitingest or clone
         run: |
           GITINGEST_URL="${{ inputs.repo_url }}"
           GITINGEST_URL="${GITINGEST_URL/github.com/gitingest.com}"
           curl -s "$GITINGEST_URL" > repo_digest.txt
           if [ ! -s repo_digest.txt ]; then
-            echo "Error: Failed to fetch digest from $GITINGEST_URL"
-            exit 1
+            echo "Warning: Gitingest failed, attempting to clone repo"
+            REPO_NAME=$(basename ${{ inputs.repo_url }} .git)
+            git clone ${{ inputs.repo_url }} $REPO_NAME
+            find $REPO_NAME -type f \( -name "*.py" -o -name "*.cpp" \) -exec cat {} \; > repo_digest.txt
+            if [ ! -s repo_digest.txt ]; then
+              echo "Error: No Python or C++ files found in repo"
+              exit 1
+            fi
           fi
+          echo "Digest content:"
+          cat repo_digest.txt
 
       - name: Call Gemini API to port to Rust
         run: |
-          PROMPT="The following is a codebase digest (from Python or C++). Port it entirely to Rust, creating a compilable project. Include Cargo.toml if needed, and all source files. Output in this exact structured format for each file, separated by ---:
+          PROMPT="The following is a codebase digest (from Python or C++). Port it to a single Rust file (main.rs) for simple scripts or a full project with Cargo.toml for complex ones. Output strictly in this format, with no extra text or explanations:
           ---
-          File: <relative/path/to/file e.g., Cargo.toml or src/main.rs>
+          File: <path, e.g., main.rs or Cargo.toml>
           Content:
           \`\`\`
-          <complete file content here>
+          <complete file content>
           \`\`\`
           ---
-          Ensure the project compiles with cargo build.
+          Ensure the code compiles with rustc or cargo build.
           
           Codebase digest:
           $(cat repo_digest.txt)"
@@ -54,17 +63,22 @@ jobs:
                 }]
               }],
               "generationConfig": {
-                "temperature": 0.2,
+                "temperature": 0.1,
                 "maxOutputTokens": 8192
               }
             }')
           
           echo "$RESPONSE" > response.json
+          echo "Gemini API response:"
+          cat response.json
           jq -r '.candidates[0].content.parts[0].text // .error.message // "Error: API call failed"' response.json > rust_project.txt
           if grep -q "Error" rust_project.txt; then
+            echo "Error in API response:"
             cat rust_project.txt
             exit 1
           fi
+          echo "Parsed LLM output:"
+          cat rust_project.txt
 
       - name: Parse LLM response to create Rust files
         run: |
@@ -75,35 +89,49 @@ jobs:
           with open('rust_project.txt', 'r') as f:
               content = f.read().strip()
 
-          # Split by --- separator
+          # Try structured format first
           sections = re.split(r'---\s*', content)
+          files_created = False
           for section in sections:
               section = section.strip()
               if not section:
+                  print("Skipping empty section")
                   continue
               
               lines = section.split('\n')
-              if not lines[0].startswith('File: '):
+              if not lines or not re.match(r'File:\s*.+', lines[0]):
+                  print(f"Skipping invalid section: {section[:50]}...")
                   continue
               
-              file_path = lines[0][6:].strip()
-              # Find start of content
-              content_start_idx = next((i for i, line in enumerate(lines) if line.startswith('Content:')), None)
+              file_path = lines[0].replace('File:', '').strip()
+              content_start_idx = next((i for i, line in enumerate(lines) if re.match(r'Content:\s*', line)), None)
               if content_start_idx is None:
+                  print(f"No Content: found for file {file_path}")
                   continue
               
               code_lines = lines[content_start_idx + 1:]
-              # Strip leading/trailing code blocks if present
-              if code_lines and code_lines[0].startswith('```'):
+              if code_lines and re.match(r'\s*```.*', code_lines[0]):
                   code_lines = code_lines[1:]
-              if code_lines and code_lines[-1].startswith('```'):
+              if code_lines and re.match(r'\s*```.*', code_lines[-1]):
                   code_lines = code_lines[:-1]
               
-              code = '\n'.join(code_lines).strip()
+              code = '\n'.join(line.rstrip() for line in code_lines).strip()
+              if not code:
+                  print(f"No code content for file {file_path}")
+                  continue
               
+              print(f"Creating file: {file_path}")
               os.makedirs(os.path.dirname(file_path), exist_ok=True)
               with open(file_path, 'w') as fw:
                   fw.write(code)
+              files_created = True
+
+          # Fallback: if no files created and content looks like Rust code, save as main.rs
+          if not files_created and 'fn main()' in content:
+              print("No structured files detected, saving as main.rs")
+              with open('main.rs', 'w') as f:
+                  content = re.sub(r'```rust\n|```', '', content).strip()
+                  f.write(content)
           EOF
 
       - name: Set up Rust
@@ -113,11 +141,16 @@ jobs:
 
       - name: Compile generated Rust project
         run: |
+          echo "Listing directory contents:"
+          ls -la
           if [ -f "Cargo.toml" ]; then
+            echo "Found Cargo.toml, building with cargo"
             cargo build --verbose
           else
             echo "No Cargo.toml found; assuming single-file project"
             if ls *.rs 1> /dev/null 2>&1; then
+              echo "Found .rs files:"
+              ls *.rs
               rustc *.rs
             else
               echo "Error: No Rust files generated"
@@ -127,7 +160,9 @@ jobs:
 
       - name: Upload Rust project artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: rust-project
           path: .
-          if-no-files-found: ignore
+          if-no-files-found: warn
+```
